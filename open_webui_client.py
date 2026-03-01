@@ -42,7 +42,7 @@ class OpenWebUIClient:
     def upload_and_add_to_knowledge(self, file_path: str, knowledge_id: str, timeout: int = 300) -> dict:
         """
         Upload a file and add it to a knowledge base.
-        Properly waits for processing to complete before adding.
+        Skips the file if a 504 Gateway Timeout error is encountered.
         
         Args:
             file_path (str): The local path to the file to be uploaded.
@@ -50,7 +50,7 @@ class OpenWebUIClient:
             timeout (int): The maximum number of seconds to wait for file processing.
             
         Returns:
-            dict: The JSON response obtained from adding the file to the knowledge base.
+            dict: The JSON response obtained from adding the file, or a skip status.
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"The file '{file_path}' does not exist.")
@@ -59,14 +59,23 @@ class OpenWebUIClient:
         
         # Step 1: Upload the file
         print(f"Uploading file: {file_path}")
-        with open(file_path, 'rb') as f:
-            response = requests.post(
-                f'{self.base_url}/api/v1/files/',
-                headers=headers,
-                files={'file': f}
-            )
         
-        if response.status_code != 200:
+        try:
+            with open(file_path, 'rb') as f:
+                response = requests.post(
+                    f'{self.base_url}/api/v1/files/',
+                    headers=headers,
+                    files={'file': f}
+                )
+        except requests.exceptions.ReadTimeout:
+            print(f"Encountered ReadTimeout. Skipping upload for: {file_path}")
+            return {"status": "skipped", "reason": "ReadTimeout during upload"}
+        
+        # Handle 504 by skipping immediately
+        if response.status_code == 504:
+            print(f"Encountered 504 Gateway Timeout. Skipping upload for: {file_path}")
+            return {"status": "skipped", "reason": "504 Gateway Timeout"}
+        elif response.status_code != 200:
             raise Exception(f"Upload failed: {response.status_code} - {response.text}")
         
         file_data = response.json()
@@ -78,12 +87,20 @@ class OpenWebUIClient:
         start_time = time.time()
         
         while time.time() - start_time < timeout:
-            status_response = requests.get(
-                f'{self.base_url}/api/v1/files/{file_id}/process/status',
-                headers=headers
-            )
+            try:
+                status_response = requests.get(
+                    f'{self.base_url}/api/v1/files/{file_id}/process/status',
+                    headers=headers
+                )
+            except requests.exceptions.ReadTimeout:
+                print(f"Encountered ReadTimeout during processing status check. Skipping: {file_path}")
+                return {"status": "skipped", "reason": "ReadTimeout during processing status check"}
             
-            if status_response.status_code != 200:
+            # If processing times out on the server side
+            if status_response.status_code == 504:
+                print(f"Encountered 504 Gateway Timeout during processing. Skipping: {file_path}")
+                return {"status": "skipped", "reason": "504 during processing"}
+            elif status_response.status_code != 200:
                 raise Exception(f"Failed to check processing status: {status_response.text}")
 
             status_data = status_response.json()
@@ -95,20 +112,28 @@ class OpenWebUIClient:
             elif status == 'failed':
                 raise Exception(f"Processing failed: {status_data.get('error')}")
             
-            time.sleep(0.5)  # Poll every 0.5 seconds
+            time.sleep(2)  # Poll every 2 seconds
         else:
             raise TimeoutError("File processing timed out")
         
         # Step 3: Add to knowledge base
         print(f"Adding file to knowledge base: {knowledge_id}")
         add_headers = {**headers, 'Content-Type': 'application/json'}
-        add_response = requests.post(
-            f'{self.base_url}/api/v1/knowledge/{knowledge_id}/file/add',
-            headers=add_headers,
-            json={'file_id': file_id}
-        )
+        try:
+            add_response = requests.post(
+                f'{self.base_url}/api/v1/knowledge/{knowledge_id}/file/add',
+                headers=add_headers,
+                json={'file_id': file_id}
+            )
+        except requests.exceptions.ReadTimeout:
+            print(f"Encountered ReadTimeout while adding to knowledge. Skipping: {file_path}")
+            return {"status": "skipped", "reason": "ReadTimeout during knowledge assignment"}
         
-        if add_response.status_code != 200:
+        # If adding to the knowledge base times out
+        if add_response.status_code == 504:
+            print(f"Encountered 504 Gateway Timeout while adding to knowledge. Skipping: {file_path}")
+            return {"status": "skipped", "reason": "504 during knowledge assignment"}
+        elif add_response.status_code != 200:
             raise Exception(f"Failed to add to knowledge: {add_response.status_code} - {add_response.text}")
         
         print(f"File successfully added to knowledge base!")
